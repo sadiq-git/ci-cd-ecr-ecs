@@ -1,0 +1,10 @@
+{
+  "name": "free-tier-poc-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node -e \"require('./server'); console.log('basic test passed')\""
+  },
+  "dependencies": { "express": "^4.18.2" }
+}
