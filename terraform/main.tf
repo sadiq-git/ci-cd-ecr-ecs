@@ -210,6 +210,9 @@ resource "aws_ecs_service" "app" {
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = 1
   launch_type     = "EC2"
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 200
+
 
   # No network_configuration block for EC2 + bridge mode
 
