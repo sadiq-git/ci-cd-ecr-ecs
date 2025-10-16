@@ -1,0 +1,44 @@
+# --- Terraform ---
+.terraform/
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfstate*
+terraform/*.tfvars
+terraform/.terraform.lock.hcl
+
+# --- AWS / Credentials / Local JSON ---
+*.tfvars
+*.json
+!bedrock-invoke-inline.json  # keep only if you want it versioned
+td-input.json
+td.json
+
+# --- Lambda builds ---
+lambda/function.zip
+
+# --- Node.js ---
+node_modules/
+npm-debug.log
+app/node_modules/
+app/package-lock.json
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.bak
+*.tmp
+
+# --- Git / Secrets ---
+*.pem
+*.key
+*.crt
+*.zip
+*.log
+
+# --- System folders ---
+.git/
+

@@ -17,6 +17,7 @@ provider "aws" {
 }
 
 # ---------- VARIABLES ----------
+
 variable "region" {
   type    = string
   default = "ap-south-1"
@@ -24,13 +25,14 @@ variable "region" {
 
 variable "app_name" {
   type    = string
-  default = "free-tier-poc"
+  default = "agentic-poc"
 }
 
 variable "ecr_repo" {
   type    = string
-  default = "free-tier-poc-repo"
+  default = "agentic-poc-repo"
 }
+
 
 # ---------- ECR ----------
 resource "aws_ecr_repository" "app" {
@@ -177,10 +179,10 @@ resource "aws_cloudwatch_log_group" "app" {
 
 resource "aws_ecs_task_definition" "app" {
   family                   = "${var.app_name}-task"
-  network_mode             = "bridge" # <- was "awsvpc"
+  network_mode             = "bridge" # EC2 launch type
   requires_compatibilities = ["EC2"]
   cpu                      = "256"
-  memory                   = "512"
+  memory                   = "256" # lowered for single t3.micro
   execution_role_arn       = aws_iam_role.ecs_task_exec.arn
 
   container_definitions = jsonencode([{
@@ -189,7 +191,7 @@ resource "aws_ecs_task_definition" "app" {
     essential = true,
     portMappings = [{
       containerPort = 3000,
-      hostPort      = 3000, # bind to the instance’s port 3000
+      hostPort      = 3000,
       protocol      = "tcp"
     }],
     logConfiguration = {
@@ -199,10 +201,10 @@ resource "aws_ecs_task_definition" "app" {
         awslogs-region        = var.region,
         awslogs-stream-prefix = "ecs"
       }
-    }
+    },
+    memory = 256
   }])
 }
-
 
 resource "aws_ecs_service" "app" {
   name            = "${var.app_name}-service"
@@ -210,15 +212,14 @@ resource "aws_ecs_service" "app" {
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = 1
   launch_type     = "EC2"
+
+  # stop-first-then-start to avoid memory clash on a single tiny EC2
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 200
 
-
-  # No network_configuration block for EC2 + bridge mode
-
+  # No network_configuration for EC2 + bridge mode
   depends_on = [aws_autoscaling_group.ecs]
 }
-
 
 # ---------- OUTPUTS ----------
 output "cluster" {

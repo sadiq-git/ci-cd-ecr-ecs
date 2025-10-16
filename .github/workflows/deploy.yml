@@ -8,10 +8,10 @@ jobs:
     permissions: { id-token: write, contents: read }
     env:
       AWS_REGION: ap-south-1
-      ECR_REPO: free-tier-poc-repo
-      ECS_CLUSTER: free-tier-poc-cluster
-      ECS_SERVICE: free-tier-poc-service
-      FAMILY: free-tier-poc-task
+      ECR_REPO: agentic-poc-repo
+      ECS_CLUSTER: agentic-poc-cluster
+      ECS_SERVICE: agentic-poc-service
+      FAMILY: agentic-poc-task
     steps:
       - uses: actions/checkout@v4
 
