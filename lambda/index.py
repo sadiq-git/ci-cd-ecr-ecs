@@ -1,121 +1,113 @@
-# lambda/index.py
-import os, json, time, logging, boto3
-from botocore.config import Config
+import os, json, logging, boto3, base64, time
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-BEDROCK_ENABLED = os.environ.get("BEDROCK_ENABLED","1") == "1"
-BEDROCK_REGION  = os.environ.get("BEDROCK_REGION","us-east-1")
-BEDROCK_MODEL   = os.environ.get("BEDROCK_MODEL","amazon.titan-text-lite-v1")
-ASSUME_ARN      = os.environ.get("BEDROCK_ASSUME_ROLE_ARN")  # cross-account role in Bedrock acct
+BEDROCK_ENABLED = os.getenv("BEDROCK_ENABLED", "1") == "1"
+BEDROCK_REGION  = os.getenv("BEDROCK_REGION", "us-east-1")
+BEDROCK_MODEL   = os.getenv("BEDROCK_MODEL", "amazon.titan-text-lite-v1")
+ASSUME_ROLE_ARN = os.getenv("BEDROCK_ASSUME_ROLE_ARN")
 
-cfg = Config(retries={"max_attempts": 3, "mode": "standard"})
+ecs = boto3.client("ecs")
+events_map = {
+    "SERVICE_TASK_CONFIGURATION_FAILURE": "Task failed to start (bad image tag, ports, memory limits, or env).",
+    "SERVICE_STEADY_STATE": "Service reached steady state.",
+}
 
-def _assume_bedrock():
-    if not ASSUME_ARN:
-        return boto3.client("bedrock-runtime", region_name=BEDROCK_REGION, config=cfg)
-    sts = boto3.client("sts", config=cfg)
-    creds = sts.assume_role(RoleArn=ASSUME_ARN, RoleSessionName="poc-self-heal")["Credentials"]
-    sess = boto3.Session(
-        aws_access_key_id=creds["AccessKeyId"],
-        aws_secret_access_key=creds["SecretAccessKey"],
-        aws_session_token=creds["SessionToken"],
-        region_name=BEDROCK_REGION,
-    )
-    return sess.client("bedrock-runtime", config=cfg)
+def _bedrock_client():
+    if not BEDROCK_ENABLED:
+        return None
+    sess = boto3.Session()
+    if ASSUME_ROLE_ARN:
+        sts = sess.client("sts")
+        creds = sts.assume_role(RoleArn=ASSUME_ROLE_ARN, RoleSessionName="bedrockCross")[ "Credentials" ]
+        return boto3.client(
+            "bedrock-runtime",
+            region_name=BEDROCK_REGION,
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+    return sess.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
-def _ecs():
-    return boto3.client("ecs", config=cfg)
+def plan_with_bedrock(summary, detail):
+    if not BEDROCK_ENABLED:
+        return {"safe_action":"note","note":"Bedrock disabled; no action"}
+    br = _bedrock_client()
+    prompt = {
+        "role": "system",
+        "content": [
+            {"text":
+             "You are a cautious SRE assistant. Propose ONE safe_action among: "
+             "note | force_redeploy | scale_up | rollback.\n"
+             "Return strict JSON: {\"diagnosis\":\"...\",\"confidence\":0-1,"
+             "\"safe_action\":\"...\",\"note\":\"...\"}.\n"
+             "Only act if it’s obviously safe."}
+        ]
+    }
+    user = {
+        "role": "user",
+        "content": [{"text": f"ECS event summary: {summary}\nDetail: {json.dumps(detail)[:3000]}"}]
+    }
 
-def _pull_recent_service_events(cluster_arn: str, service_arn_or_name: str, limit=6):
-    ecs = _ecs()
-    svc = ecs.describe_services(cluster=cluster_arn, services=[service_arn_or_name])["services"][0]
-    events = svc.get("events", [])[:limit]
-    return [{"message": e["message"], "createdAt": e["createdAt"].isoformat()} for e in events]
+    body = {"inputText": json.dumps([prompt, user])}
+    try:
+        resp = br.invoke_model(modelId=BEDROCK_MODEL, body=json.dumps(body).encode("utf-8"))
+        data = json.loads(resp["body"].read())
+        text = data["results"][0]["outputText"]
+        # Extract JSON if the model wrapped it
+        start = text.find("{")
+        end   = text.rfind("}")
+        plan = json.loads(text[start:end+1]) if start!=-1 and end!=-1 else {"safe_action":"note","note":text}
+        return plan
+    except Exception as e:
+        log.exception("Bedrock plan failed")
+        return {"safe_action":"note","note":f"Bedrock error: {e}"}
 
-PROMPT = """You are a DevOps SRE assistant. Given the following AWS ECS event and recent service events, diagnose the most likely root cause and propose ONE safe action.
+def maybe_execute(plan, detail):
+    action = plan.get("safe_action","note")
+    note   = plan.get("note","")
+    # Extract cluster/service if present
+    cluster = detail.get("clusterArn","").split("/")[-1] if "clusterArn" in detail else None
+    group   = detail.get("group","")  # e.g. service:agentic-poc-service
+    service = group.split(":")[1] if group.startswith("service:") else None
 
-Return STRICT JSON with keys:
-- diagnosis: short string
-- confidence: number between 0 and 1
-- safe_action: one of ["none","force_redeploy","scale_up","note"]
-- note: short operator note
+    if not cluster or not service:
+        log.info("No cluster/service in event; action=note")
+        return {"executed": False, "reason": "missing cluster/service"}
 
-EVENT:
-{event}
+    if action == "force_redeploy":
+        ecs.update_service(cluster=cluster, service=service, forceNewDeployment=True)
+        return {"executed": True, "action": action}
 
-RECENT_SERVICE_EVENTS:
-{svc_events}
-"""
+    if action == "scale_up":
+        ecs.update_service(cluster=cluster, service=service, desiredCount=1)
+        return {"executed": True, "action": action}
 
-def _ask_bedrock(event, svc_events):
-    br = _assume_bedrock()
-    body = {"inputText": PROMPT.format(event=json.dumps(event)[:5000],
-                                       svc_events=json.dumps(svc_events)[:5000])}
-    resp = br.invoke_model(
-        modelId=BEDROCK_MODEL,
-        accept="application/json",
-        contentType="application/json",
-        body=json.dumps(body),
-    )
-    data = json.loads(resp["body"].read())
-    text = (data.get("results") or [{}])[0].get("outputText", "{}")
-    # try parse JSON from model output (allow leading text/newlines)
-    start = text.find("{")
-    end = text.rfind("}")
-    parsed = json.loads(text[start:end+1]) if start != -1 and end != -1 else {"diagnosis": text, "safe_action":"note", "confidence":0.5, "note":"LLM returned free text"}
-    return parsed, data
+    if action == "rollback":
+        # naive rollback: set lastKnownTaskDefinition if present
+        # (For real rollback keep a history in SSM/Dynamo.)
+        desc = ecs.describe_services(cluster=cluster, services=[service])["services"][0]
+        # nothing to revert to here; keep as note unless you track versions
+        return {"executed": False, "reason":"no rollback history; consider SSM param store"}
 
-def _maybe_remediate(event, plan):
-    safe_action = (plan.get("safe_action") or "none").lower()
-    if safe_action not in {"force_redeploy","scale_up"}:
-        return "no-op"
-
-    detail = event.get("detail", {})
-    cluster_arn = detail.get("clusterArn") or event.get("resources", [""])[0]
-    group = detail.get("group", "")  # e.g., service:agentic-poc-service
-    service_name = group.split(":")[1] if ":" in group else None
-    if not (cluster_arn and service_name):
-        return "missing-cluster-or-service"
-
-    ecs = _ecs()
-    if safe_action == "force_redeploy":
-        ecs.update_service(cluster=cluster_arn, service=service_name, forceNewDeployment=True)
-        return f"forced new deployment for {service_name}"
-
-    if safe_action == "scale_up":
-        # very conservative: +1 desired if currently 0
-        svc = ecs.describe_services(cluster=cluster_arn, services=[service_name])["services"][0]
-        desired = svc.get("desiredCount", 0)
-        if desired == 0:
-            ecs.update_service(cluster=cluster_arn, service=service_name, desiredCount=1)
-            return f"scaled {service_name} from 0 -> 1"
-        return "scale_up_skipped_nonzero_desired"
+    # default is note
+    return {"executed": False, "action": "note", "note": note}
 
 def handler(event, context):
-    log.info("Self-heal trigger: %s", json.dumps(event))
-    if not BEDROCK_ENABLED:
-        return {"statusCode": 200, "body": json.dumps({"ok": True, "note":"bedrock disabled"})}
+    log.info(f"Agentic trigger: {json.dumps(event)}")
+    # Normalize: ECS events or manual test payloads
+    detail_type = event.get("detail-type")
+    if not detail_type:
+        # manual ping
+        summary = f"Manual trigger: {event}"
+        detail  = {}
+    else:
+        summary = events_map.get(event.get("detail",{}).get("eventName",""), detail_type)
+        detail  = event.get("detail", {})
 
-    try:
-        detail = event.get("detail", {})
-        cluster_arn = detail.get("clusterArn")
-        group = detail.get("group","")
-        service = group.split(":")[1] if ":" in group else None
-        svc_events = _pull_recent_service_events(cluster_arn, service) if (cluster_arn and service) else []
-
-        t0 = time.time()
-        plan, raw = _ask_bedrock(event, svc_events)
-        t1 = time.time()
-
-        action_result = _maybe_remediate(event, plan)
-        t2 = time.time()
-
-        log.info("Plan: %s", json.dumps(plan))
-        log.info("Bedrock latency: %.0fms, Remediation time: %.0fms",
-                 (t1-t0)*1000, (t2-t1)*1000)
-        return {"statusCode": 200, "body": json.dumps({"ok": True, "plan": plan, "action": action_result})}
-    except Exception as e:
-        log.exception("self-heal failed")
-        return {"statusCode": 500, "body": json.dumps({"ok": False, "error": str(e)})}
+    plan  = plan_with_bedrock(summary, detail)
+    acted = maybe_execute(plan, detail)
+    out = {"ok": True, "summary": summary, "plan": plan, "acted": acted}
+    log.info("Plan: " + json.dumps(out))
+    return {"statusCode": 200, "body": json.dumps(out)}
